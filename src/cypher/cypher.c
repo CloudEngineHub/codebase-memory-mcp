@@ -575,8 +575,7 @@ static int parse_node(parser_t *p, cbm_node_pattern_t *out) {
                 ll += w;
             }
             if (ll >= (int)sizeof(lbuf)) {
-                ll = (int)sizeof(lbuf) - SKIP_ONE;
-                break;
+                break; /* buffer full */
             }
         }
         out->label = heap_strdup(lbuf);
@@ -3101,8 +3100,7 @@ static void with_proj_key(cbm_return_clause_t *wc, binding_t *b, char *key, size
             kl += w;
         }
         if (kl >= (int)key_sz) {
-            kl = (int)key_sz - SKIP_ONE;
-            break;
+            break; /* buffer full */
         }
     }
 }
