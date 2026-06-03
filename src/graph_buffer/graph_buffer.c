@@ -30,6 +30,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
+#include "foundation/mem.h"
 #include <sqlite3.h>
 
 #include <stdatomic.h>
@@ -1199,9 +1200,14 @@ static int cmp_dump_vectors_by_id(const void *a, const void *b) {
 }
 
 static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *temp_to_final,
-                                     int64_t max_temp_id, int *out_count) {
-    CBMDumpNode *dump_nodes =
-        malloc((size_t)(live_count > 0 ? live_count : SKIP_ONE) * sizeof(CBMDumpNode));
+                                     int64_t max_temp_id, int *out_count,
+                                     cbm_gbuf_node_t ***src_out) {
+    size_t cap = (size_t)(live_count > 0 ? live_count : SKIP_ONE);
+    CBMDumpNode *dump_nodes = malloc(cap * sizeof(CBMDumpNode));
+    /* Parallel gbuf-node pointers so a streamed partition can free its heavy
+     * properties_json after the rows are persisted. NULL on OOM disables the
+     * per-partition free (the dump still succeeds). */
+    cbm_gbuf_node_t **src = malloc(cap * sizeof(cbm_gbuf_node_t *));
     int idx = 0;
 
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -1228,10 +1234,14 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
             .end_line = n->end_line,
             .properties = props,
         };
+        if (src) {
+            src[idx] = n;
+        }
         idx++;
     }
 
     *out_count = idx;
+    *src_out = src;
     return dump_nodes;
 }
 
@@ -1390,31 +1400,77 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
 
     int node_idx = 0;
+    cbm_gbuf_node_t **src_nodes = NULL;
     CBMDumpNode *dump_nodes =
-        build_dump_nodes(gb, live_count, temp_to_final, max_temp_id, &node_idx);
+        build_dump_nodes(gb, live_count, temp_to_final, max_temp_id, &node_idx, &src_nodes);
     CBM_PROF_END_N("dump", "2_build_dump_nodes", t_build_nodes, node_idx);
-
-    CBM_PROF_START(t_build_edges);
-    int edge_idx = 0;
-    char **url_paths = NULL;
-    CBMDumpEdge *dump_edges =
-        build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths);
-    CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges, edge_idx);
 
     char indexed_at[CBM_SZ_64];
     generate_iso_timestamp(indexed_at, sizeof(indexed_at));
 
-    release_and_remap_vectors(gb, temp_to_final, max_temp_id);
+    /* Stream node rows to the DB in partitions. Under memory pressure, free each
+     * partition's heavy properties_json once persisted — the heavy column is
+     * write-once and never read again, so this bounds the dump/finalize peak.
+     * The DB output is identical whether or not freeing engages, so non-pressure
+     * runs (and tests) leave the gbuf intact (the budget>0 guard keeps an
+     * uninitialized budget from ever triggering the free). */
+    cbm_db_writer_t *w = cbm_writer_open(path);
+    if (!w) {
+        free(src_nodes);
+        free(dump_nodes);
+        free(temp_to_final);
+        return CBM_NOT_FOUND;
+    }
 
-    /* Sub-phase: Write SQLite DB file (B-tree writer) */
-    CBM_PROF_START(t_write_db);
-    int rc = cbm_write_db(path, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
-                          dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
-                          gb->dump_token_vecs, gb->dump_token_vec_count);
-    CBM_PROF_END_N("dump", "6_write_db_btree", t_write_db, node_idx + edge_idx);
+    CBM_PROF_START(t_append);
+    enum { DUMP_PARTITION_NODES = 1 << 16 };
+    bool free_heavy = false;
+    int rc = 0;
+    for (int off = 0; off < node_idx; off += DUMP_PARTITION_NODES) {
+        int chunk = node_idx - off;
+        if (chunk > DUMP_PARTITION_NODES) {
+            chunk = DUMP_PARTITION_NODES;
+        }
+        rc = cbm_writer_append_nodes(w, &dump_nodes[off], chunk);
+        if (rc != 0) {
+            break;
+        }
+        free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_over_budget());
+        if (free_heavy && src_nodes) {
+            for (int j = off; j < off + chunk; j++) {
+                free(src_nodes[j]->properties_json);
+                src_nodes[j]->properties_json = NULL;
+                dump_nodes[j].properties = NULL;
+            }
+            cbm_mem_collect();
+        }
+    }
+    CBM_PROF_END_N("dump", "2b_stream_append_nodes", t_append, node_idx);
+
+    int edge_idx = 0;
+    char **url_paths = NULL;
+    CBMDumpEdge *dump_edges = NULL;
+    if (rc == 0) {
+        CBM_PROF_START(t_build_edges);
+        dump_edges = build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths);
+        CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges, edge_idx);
+        release_and_remap_vectors(gb, temp_to_final, max_temp_id);
+    }
+
+    /* Finalize: nodes-table interior + edges/vectors/metadata/indexes/sqlite_master.
+     * Frees w and closes the file; handles a prior append error cleanly. */
+    CBM_PROF_START(t_finalize);
+    int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
+                                  dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
+                                  gb->dump_token_vecs, gb->dump_token_vec_count);
+    CBM_PROF_END_N("dump", "6_write_db_finalize", t_finalize, node_idx + edge_idx);
+    if (rc == 0) {
+        rc = frc;
+    }
 
     log_dump_summary(node_idx, edge_idx);
     free_dump_resources(url_paths, edge_idx, dump_edges, dump_nodes, temp_to_final);
+    free(src_nodes);
     return rc;
 }
 
