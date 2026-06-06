@@ -1076,6 +1076,25 @@ TEST(contract_edge_tests) {
     ASSERT_TRUE(edge_present(f, 2, "TESTS", 1)); /* TestAdd->Add, TestMul->Mul */
     PASS();
 }
+/* #408: package.json `workspaces` cross-package IMPORTS produce zero edges
+ * (v0.7.0 follow-up to #308, which fixed tsconfig `paths`). A Lerna/Yarn-style
+ * monorepo where packages/b imports a sibling by its package name (@org/a) should
+ * resolve via the sibling's package.json `name` -> dir (pass_pkgmap.c) into a
+ * cross-package IMPORTS edge. Today bare-specifier workspace imports yield zero.
+ * RED until workspace `@org/pkg` resolution produces the edge. */
+TEST(contract_edge_workspaces_imports_issue408) {
+    static const LangFile f[] = {
+        {"package.json", "{\"name\":\"root\",\"private\":true,\"workspaces\":[\"packages/*\"]}\n"},
+        {"packages/a/package.json", "{\"name\":\"@org/a\",\"version\":\"1.0.0\",\"main\":\"index.js\"}\n"},
+        {"packages/a/index.js", "export function fromA() {\n  return 1;\n}\n"},
+        {"packages/b/package.json",
+         "{\"name\":\"@org/b\",\"version\":\"1.0.0\",\"main\":\"index.js\","
+         "\"dependencies\":{\"@org/a\":\"1.0.0\"}}\n"},
+        {"packages/b/index.js",
+         "import { fromA } from '@org/a';\n\nexport function useA() {\n  return fromA();\n}\n"}};
+    ASSERT_TRUE(edge_present(f, 5, "IMPORTS", 1));
+    PASS();
+}
 
 /* DEPENDS_ON — Helm Chart.yaml `dependencies:` -> per-dependency Chart node.
  * Basename must be exactly "Chart.yaml"; pass_k8s runs in both pipeline paths. */
@@ -1278,6 +1297,7 @@ SUITE(lang_contract) {
      * parallel-path service edges (GRAPHQL/GRPC/TRPC_CALLS + INFRA_MAPS), and
      * FILE_CHANGES_WITH (git co-change). Completes 25-edge-type coverage. */
     RUN_TEST(contract_edge_tests);
+    RUN_TEST(contract_edge_workspaces_imports_issue408);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);
     RUN_TEST(contract_edge_file_changes_with);
