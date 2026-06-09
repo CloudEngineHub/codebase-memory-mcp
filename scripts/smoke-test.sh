@@ -123,6 +123,19 @@ GENEOF
 RESULT=$(cli index_repository "{\"repo_path\":\"$TMPDIR\"}")
 echo "$RESULT"
 
+# Allocator-integrity guard: the prod binary overrides the global allocator with
+# mimalloc. A misconfigured override (e.g. compiling alloc-override.c's
+# forwarding defs on a platform where system libs keep using the system
+# allocator) corrupts free() and mimalloc prints "mimalloc: error: ..." to
+# stderr — often WITHOUT a non-zero exit. Treat any such line as a hard failure.
+if grep -qiE 'mimalloc: error|mi_free: invalid pointer|mi_assert' "$CLI_STDERR"; then
+  echo "FAIL: mimalloc reported an allocator error during indexing"
+  echo "--- stderr ---"
+  cat "$CLI_STDERR"
+  echo "--- end stderr ---"
+  exit 1
+fi
+
 STATUS=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('status',''))" 2>/dev/null || echo "")
 if [ "$STATUS" != "indexed" ]; then
   echo "FAIL: index status is '$STATUS', expected 'indexed'"
